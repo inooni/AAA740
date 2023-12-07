@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pytorch_lightning as pl
+import copy
 from torch.optim.lr_scheduler import LambdaLR
 from einops import rearrange, repeat
 from contextlib import contextmanager
@@ -561,6 +562,20 @@ class LatentDiffusion(DDPM):
             c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
         return c
 
+    def get_learned_conditioning_freeze(self, c):
+        with torch.no_grad():
+            if self.cond_stage_forward is None:
+                if hasattr(self.cond_stage_model2, 'encode') and callable(self.cond_stage_model2.encode):
+                    c = self.cond_stage_model2.encode(c)
+                    if isinstance(c, DiagonalGaussianDistribution):
+                        c = c.mode()
+                else:
+                    c = self.cond_stage_model2(c)
+            else:
+                assert hasattr(self.cond_stage_model2, self.cond_stage_forward)
+                c = getattr(self.cond_stage_model2, self.cond_stage_forward)(c)
+        return c
+
     def meshgrid(self, h, w):
         y = torch.arange(0, h).view(h, 1, 1).repeat(1, w, 1)
         x = torch.arange(0, w).view(1, w, 1).repeat(h, 1, 1)
@@ -660,12 +675,15 @@ class LatentDiffusion(DDPM):
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
 
+        c = None
+        c2 = None
         if self.model.conditioning_key is not None:
             if cond_key is None:
                 cond_key = self.cond_stage_key
             if cond_key != self.first_stage_key:
                 if cond_key in ['caption', 'coordinates_bbox']:
-                    xc = batch[cond_key]
+                    xc = batch['caption_ori']
+                    xc2 = batch['caption_prompt']
                 elif cond_key == 'class_label':
                     xc = batch
                 else:
@@ -680,13 +698,17 @@ class LatentDiffusion(DDPM):
                     c = self.get_learned_conditioning(xc.to(self.device))
             else:
                 c = xc
+                c2 = xc2
             if bs is not None:
                 c = c[:bs]
+                if c2 != None:
+                    c2 = c2[:bs]
 
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 ckey = __conditioning_keys__[self.model.conditioning_key]
                 c = {ckey: c, 'pos_x': pos_x, 'pos_y': pos_y}
+                c2 = {ckey: c2, 'pos_x': pos_x, 'pos_y': pos_y}
 
         else:
             c = None
@@ -694,12 +716,13 @@ class LatentDiffusion(DDPM):
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 c = {'pos_x': pos_x, 'pos_y': pos_y}
-        out = [z, c]
+        out = [z, c, c2]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
         if return_original_cond:
             out.append(xc)
+            out.append(xc2)
         return out
 
     @torch.no_grad()
@@ -863,20 +886,21 @@ class LatentDiffusion(DDPM):
             return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
-        x, c = self.get_input(batch, self.first_stage_key)
-        loss = self(x, c)
+        x, c, c2 = self.get_input(batch, self.first_stage_key)
+        loss = self(x, c, c2)
         return loss
 
-    def forward(self, x, c, *args, **kwargs):
+    def forward(self, x, c, c2, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
             if self.cond_stage_trainable:
                 c = self.get_learned_conditioning(c)
+                c2 = self.get_learned_conditioning_freeze(c2)
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        return self.p_losses(x, c, t, *args, **kwargs)
+        return self.p_losses(x, c, c2, t, *args, **kwargs)
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
         def rescale_bbox(bbox):
@@ -1009,10 +1033,11 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        model_output = self.apply_model(x_noisy, t, cond)
+    def p_losses(self, x_start, cond, cond2, t, noise=None):
+        # noise = default(noise, lambda: torch.randn_like(x_start))
+        # x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        # model_output = self.apply_model(x_noisy, t, cond)
+        # model_output2 = self.apply_model(x_noisy, t, cond2)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -1024,22 +1049,19 @@ class LatentDiffusion(DDPM):
         else:
             raise NotImplementedError()
 
-        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
-        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+        # latent space (don't need model_outputs)
+        loss = self.get_loss(cond, cond2, mean=False).mean([1, 2])
+        loss = loss.mean()
 
-        logvar_t = self.logvar[t].to(self.device)
-        loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
-        if self.learn_logvar:
-            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
-            loss_dict.update({'logvar': self.logvar.data.mean()})
+        # # image space
+        # loss_simple = self.get_loss(model_output, model_output2, mean=False).mean([1, 2, 3])
+        # loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        loss = self.l_simple_weight * loss.mean()
+        # self.logvar = self.logvar.to(self.device)
+        # logvar_t = self.logvar[t].to(self.device)
+        # loss = loss_simple / torch.exp(logvar_t)
+        # loss = self.l_simple_weight * loss.mean()
 
-        loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
-        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
-        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
-        loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
 
         return loss, loss_dict
@@ -1255,7 +1277,7 @@ class LatentDiffusion(DDPM):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, c, x, xrec, xc = self.get_input(batch, self.first_stage_key,
+        z, c, c2, x, xrec, xc, xc2 = self.get_input(batch, self.first_stage_key,
                                            return_first_stage_outputs=True,
                                            force_c_encode=True,
                                            return_original_cond=True,
@@ -1269,7 +1291,7 @@ class LatentDiffusion(DDPM):
                 xc = self.cond_stage_model.decode(c)
                 log["conditioning"] = xc
             elif self.cond_stage_key in ["caption"]:
-                xc = log_txt_as_img((x.shape[2], x.shape[3]), batch["caption"])
+                xc = log_txt_as_img((x.shape[2], x.shape[3]), batch["caption_ori"])
                 log["conditioning"] = xc
             elif self.cond_stage_key == 'class_label':
                 xc = log_txt_as_img((x.shape[2], x.shape[3]), batch["human_label"])
@@ -1360,7 +1382,15 @@ class LatentDiffusion(DDPM):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        params = list(self.model.parameters())
+
+        self.cond_stage_model2 = copy.deepcopy(self.cond_stage_model)
+        for param in self.model.parameters():
+            param.requires_grad = False
+        for param in self.cond_stage_model2.parameters():
+            param.requires_grad = False
+
+        params = []
+        # params = list(self.model.parameters())
         if self.cond_stage_trainable:
             print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
             params = params + list(self.cond_stage_model.parameters())
